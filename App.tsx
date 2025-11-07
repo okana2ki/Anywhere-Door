@@ -307,12 +307,28 @@ const App: React.FC = () => {
       try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         
-        const translationPrompt = `Translate the following Japanese phrase into the primary language spoken in ${finalLocation}. The phrase is: "${textToTranslate}". Please only provide the translated text as your response.`;
+        const translationPrompt = `Translate the following Japanese phrase into the primary language spoken in ${finalLocation}. The phrase is: "${textToTranslate}". Please only provide the translated text as your response. If you cannot determine a primary language for the location, please respond with the exact phrase "NO_LANGUAGE_FOUND".`;
         const translationResponse = await ai.models.generateContent({
             model: 'gemini-2.5-flash',
             contents: translationPrompt,
         });
-        const translated = translationResponse.text;
+        const translated = translationResponse.text.trim();
+
+        if (translated === 'NO_LANGUAGE_FOUND') {
+          setStatusMessage(`ごめんなさい、「${finalLocation}」で話されている言葉がわかりませんでした。`);
+          setTimeout(() => {
+            setStatusMessage(`「タケコプター」か「翻訳こんにゃく」と言ってみて！`);
+            setAppState('IMAGE_DISPLAYED');
+            setTextToTranslate('');
+            setTranslatedText('');
+          }, 4000);
+          return;
+        }
+        
+        if (!translated) {
+          throw new Error("Translation resulted in empty text, which is invalid for the speech synthesis API.");
+        }
+
         setTranslatedText(translated);
         setStatusMessage(`翻訳結果: ${translated}`);
 
@@ -357,7 +373,7 @@ const App: React.FC = () => {
 
       } catch (error) {
         console.error("Error during translation or speech synthesis:", error);
-        setStatusMessage('翻訳に失敗しました。もう一度試してね。');
+        setStatusMessage('翻訳または音声の生成に失敗しました。もう一度試してね。');
         setAppState('ERROR');
       }
     };
