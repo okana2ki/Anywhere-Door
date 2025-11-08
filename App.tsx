@@ -96,11 +96,14 @@ const App: React.FC = () => {
   const [currentAerialImageIndex, setCurrentAerialImageIndex] = useState(0);
   const [textToTranslate, setTextToTranslate] = useState('');
   const [translatedText, setTranslatedText] = useState('');
+  const [nativeResponseText, setNativeResponseText] = useState('');
+  const [japaneseTranslationText, setJapaneseTranslationText] = useState('');
 
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const appStateRef = useRef(appState);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const previousAppStateBeforeTranslation = useRef<AppState>('IMAGE_DISPLAYED');
   appStateRef.current = appState;
 
   const startListening = useCallback(() => {
@@ -110,7 +113,7 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    const activeListeningStates: AppState[] = ['READY', 'AWAITING_LOCATION', 'IMAGE_DISPLAYED', 'AWAITING_TRANSLATION_INPUT'];
+    const activeListeningStates: AppState[] = ['READY', 'AWAITING_LOCATION', 'IMAGE_DISPLAYED', 'AERIAL_IMAGES_DISPLAYED', 'AWAITING_TRANSLATION_INPUT'];
     if (!activeListeningStates.includes(appState)) return;
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -155,10 +158,12 @@ const App: React.FC = () => {
           setAppState('GENERATING_IMAGE');
           break;
         case 'IMAGE_DISPLAYED':
-          if (cleanedTranscript.includes(TAKECOPTER)) {
+        case 'AERIAL_IMAGES_DISPLAYED':
+          if (cleanedTranscript.includes(TAKECOPTER) && currentState === 'IMAGE_DISPLAYED') {
             setStatusMessage('タケコプター！高度を上げていくよ！');
             setAppState('GENERATING_AERIAL_IMAGES');
           } else if (cleanedTranscript.includes(HONYAKU_KONNYAKU)) {
+            previousAppStateBeforeTranslation.current = currentState;
             setStatusMessage('翻訳こんにゃく！何を翻訳する？');
             setAppState('AWAITING_TRANSLATION_INPUT');
           }
@@ -284,7 +289,7 @@ const App: React.FC = () => {
         setAerialImages([imageUrl, ...generatedUrls]);
         setCurrentAerialImageIndex(0);
         setAppState('AERIAL_IMAGES_DISPLAYED');
-        setStatusMessage('上空からの景色だよ！');
+        setStatusMessage('上空からの景色だよ！「翻訳こんにゃく」と言ってみて！');
 
       } catch (error) {
         console.error("Error generating aerial images:", error);
@@ -302,83 +307,135 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (appState !== 'TRANSLATING' || !textToTranslate || !finalLocation) return;
+    
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-    const translateAndSpeak = async () => {
+    const playAudio = (text: string, voiceName: 'Kore' | 'Puck'): Promise<void> => {
+      return new Promise(async (resolve, reject) => {
+        try {
+          const ttsResponse = await ai.models.generateContent({
+            model: "gemini-2.5-flash-preview-tts",
+            contents: [{ parts: [{ text }] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName },
+                },
+              },
+            },
+          });
+
+          const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          if (base64Audio) {
+            if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+              audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+            }
+            const audioContext = audioContextRef.current;
+            const audioBuffer = await decodeAudioData(
+                decode(base64Audio),
+                audioContext,
+                24000,
+                1,
+            );
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+            source.start();
+            source.onended = () => resolve();
+          } else {
+            reject(new Error("No audio data was generated."));
+          }
+        } catch(e) {
+            reject(e);
+        }
+      });
+    };
+
+    const conversationFlow = async () => {
       try {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        
-        const translationPrompt = `Translate the following Japanese phrase into the primary language spoken in ${finalLocation}. The phrase is: "${textToTranslate}". Please only provide the translated text as your response. If you cannot determine a primary language for the location, please respond with the exact phrase "NO_LANGUAGE_FOUND".`;
+        // 0. Identify the language of the location
+        const languageIdentificationPrompt = `What is the primary spoken language in ${finalLocation}? Respond with the name of the language in English (e.g., "Spanish", "French", "Mandarin Chinese"). If you cannot determine a primary language, respond with the exact phrase "NO_LANGUAGE_FOUND".`;
+        const languageResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: languageIdentificationPrompt,
+        });
+        const languageName = languageResponse.text.trim();
+
+        if (languageName === 'NO_LANGUAGE_FOUND' || !languageName) {
+          setStatusMessage(`ごめんなさい、「${finalLocation}」で話されている言葉がわかりませんでした。`);
+          setTimeout(() => {
+            const prevState = previousAppStateBeforeTranslation.current;
+            setStatusMessage(prevState === 'AERIAL_IMAGES_DISPLAYED'
+              ? '上空からの景色だよ！「翻訳こんにゃく」と言ってみて！'
+              : `「${finalLocation}」に到着！「タケコプター」か「翻訳こんにゃく」と言ってみて！`);
+            setAppState(prevState);
+            setTextToTranslate('');
+          }, 4000);
+          return;
+        }
+
+        // 1. Translate Japanese to local language and speak (Voice A)
+        const translationPrompt = `Translate the following Japanese phrase into ${languageName}. The phrase is: "${textToTranslate}". Please only provide the translated text as your response.`;
         const translationResponse = await ai.models.generateContent({
             model: 'gemini-2.5-flash',
             contents: translationPrompt,
         });
         const translated = translationResponse.text.trim();
 
-        if (translated === 'NO_LANGUAGE_FOUND') {
-          setStatusMessage(`ごめんなさい、「${finalLocation}」で話されている言葉がわかりませんでした。`);
-          setTimeout(() => {
-            setStatusMessage(`「タケコプター」か「翻訳こんにゃく」と言ってみて！`);
-            setAppState('IMAGE_DISPLAYED');
-            setTextToTranslate('');
-            setTranslatedText('');
-          }, 4000);
-          return;
-        }
-        
-        if (!translated) {
-          throw new Error("Translation resulted in empty text, which is invalid for the speech synthesis API.");
-        }
+        if (!translated) throw new Error("Translation resulted in empty text.");
 
         setTranslatedText(translated);
-        setStatusMessage(`翻訳結果: ${translated}`);
+        setStatusMessage(`【あなた】 ${translated}`);
+        await playAudio(translated, 'Kore');
 
-        const ttsResponse = await ai.models.generateContent({
-          model: "gemini-2.5-flash-preview-tts",
-          contents: [{ parts: [{ text: translated }] }],
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: 'Kore' },
-              },
-            },
-          },
+        // 2. Generate native response and speak (Voice B)
+        setStatusMessage('相手の応答を生成中...');
+        const responsePrompt = `You are a native ${languageName} speaker from ${finalLocation}. Someone just said to you in ${languageName}: "${translated}". Generate a short, natural, and conversational response in ${languageName}. Provide only the response text. Do not use any other language.`;
+        const nativeResponseResult = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: responsePrompt
         });
+        const nativeResponse = nativeResponseResult.text.trim();
+        if (!nativeResponse) throw new Error("Failed to generate a native response.");
 
-        const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-        if (base64Audio) {
-          if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-            audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-          }
-          const audioContext = audioContextRef.current;
-          const audioBuffer = await decodeAudioData(
-              decode(base64Audio),
-              audioContext,
-              24000,
-              1,
-          );
-          const source = audioContext.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(audioContext.destination);
-          source.start();
-          source.onended = () => {
-              setStatusMessage(`「タケコプター」か「翻訳こんにゃく」と言ってみて！`);
-              setAppState('IMAGE_DISPLAYED');
-              setTextToTranslate('');
-              setTranslatedText('');
-          };
-        } else {
-           throw new Error("No audio data was generated.");
-        }
+        setNativeResponseText(nativeResponse);
+        setStatusMessage(`【現地の人】 ${nativeResponse}`);
+        await playAudio(nativeResponse, 'Puck');
+
+        // 3. Translate native response back to Japanese and speak (Voice A)
+        setStatusMessage('応答を日本語に翻訳中...');
+        const japaneseTranslationPrompt = `Translate the following phrase from ${languageName} into Japanese: "${nativeResponse}". Please provide only the Japanese translation.`;
+        const japaneseTranslationResult = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: japaneseTranslationPrompt,
+        });
+        const japaneseTranslation = japaneseTranslationResult.text.trim();
+        if (!japaneseTranslation) throw new Error("Failed to translate response to Japanese.");
+
+        setJapaneseTranslationText(japaneseTranslation);
+        setStatusMessage(`【日本語訳】 ${japaneseTranslation}`);
+        await playAudio(japaneseTranslation, 'Kore');
+        
+        // 4. End of conversation and reset
+        const prevState = previousAppStateBeforeTranslation.current;
+        setStatusMessage(prevState === 'AERIAL_IMAGES_DISPLAYED'
+          ? '上空からの景色だよ！「翻訳こんにゃく」と言ってみて！'
+          : `「${finalLocation}」に到着！「タケコプター」か「翻訳こんにゃく」と言ってみて！`);
+        setAppState(prevState);
+        setTextToTranslate('');
+        setTranslatedText('');
+        setNativeResponseText('');
+        setJapaneseTranslationText('');
 
       } catch (error) {
-        console.error("Error during translation or speech synthesis:", error);
-        setStatusMessage('翻訳または音声の生成に失敗しました。もう一度試してね。');
+        console.error("Error during translation conversation flow:", error);
+        setStatusMessage('翻訳または応答の生成に失敗しました。');
         setAppState('ERROR');
       }
     };
 
-    translateAndSpeak();
+    conversationFlow();
   }, [appState, textToTranslate, finalLocation]);
   
   // Effect for slideshow progression
@@ -426,9 +483,11 @@ const App: React.FC = () => {
     setCurrentAerialImageIndex(0);
     setTextToTranslate('');
     setTranslatedText('');
+    setNativeResponseText('');
+    setJapaneseTranslationText('');
   }
 
-  const isListening = ['READY', 'AWAITING_LOCATION', 'IMAGE_DISPLAYED', 'AWAITING_TRANSLATION_INPUT'].includes(appState);
+  const isListening = ['READY', 'AWAITING_LOCATION', 'IMAGE_DISPLAYED', 'AERIAL_IMAGES_DISPLAYED', 'AWAITING_TRANSLATION_INPUT'].includes(appState);
   const showResetButton = ['IMAGE_DISPLAYED', 'AERIAL_IMAGES_DISPLAYED', 'ERROR'].includes(appState);
   const isLoading = ['GENERATING_IMAGE', 'GENERATING_AERIAL_IMAGES', 'TRANSLATING'].includes(appState);
 
